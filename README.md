@@ -1,2 +1,2 @@
 # Docky
-A lightweight, safe Docker management CLI for monitoring, updating, and managing self-hosted containers.
+Docky — A clean terminal-based Docker manager for self-hosted servers. Monitor Compose projects, check image updates, safely update containers, and eventually manage everything through an interactive TUI.
