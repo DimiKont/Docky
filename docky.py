@@ -2,15 +2,16 @@
 # docky.py
 
 import sys
-from Docky.utils import Colors, color
-import Docky.commands as commands
+from utils import Colors, color
+import commands
 
 def show_usage():
-    print(f"\n{color('🐳 DOCKY', Colors.BOLD + Colors.CYAN)}\n{color('Docker Server Manager', Colors.DIM)}\n")
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n{color('Docker Server Manager', Colors.DIM)}\n")
     print(color("Usage:", Colors.BOLD) + "\n  docky <command> [target]\n")
     print(color("Commands:", Colors.BOLD))
     cmds = [
         ("status", "Show Docker projects, containers, and system metrics"),
+        ("top", "Show real-time CPU and RAM usage mapped to your projects"),
         ("updates", "Check for available image updates"),
         ("upgrade", "Automatically pull and recreate outdated containers"),
         ("sweep", "Find and safely clear ghost data & unused images"),
@@ -29,16 +30,17 @@ def main():
             
         cmd = sys.argv[1].lower()
         if cmd == "status": commands.cmd_status()
+        elif cmd == "top": commands.cmd_top()
         elif cmd in ("updates", "update"): commands.cmd_updates(is_upgrade=False)
         elif cmd == "upgrade": commands.cmd_updates(is_upgrade=True)
         elif cmd == "sweep": commands.cmd_sweep()
         elif cmd in ("start", "stop", "restart"):
             if len(sys.argv) < 3:
-                print(f"\n{color('Missing target.', Colors.RED)}\nUsage: {color(f'docky {cmd} <project_name|all>', Colors.BOLD)}\n")
+                print(f"\n{color('! Missing target.', Colors.RED)}\nUsage: {color(f'docky {cmd} <project_name|all>', Colors.BOLD)}\n")
             else:
                 commands.cmd_lifecycle(cmd, sys.argv[2])
         else:
-            print(f"\n{color(f'Unknown command: {cmd}', Colors.RED)}")
+            print(f"\n{color(f'! Unknown command: {cmd}', Colors.RED)}")
             show_usage()
             
     except KeyboardInterrupt:

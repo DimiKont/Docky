@@ -3,7 +3,7 @@ import sys
 import time
 import re
 import concurrent.futures
-from Docky.utils import Colors, color, run_command, get_system_metrics
+from utils import Colors, color, run_command, get_system_metrics
 import docker_api
 
 def get_spinner(idx):
@@ -15,7 +15,7 @@ def container_indicator(state):
     if state == "running": return color("●", Colors.GREEN)
     if state == "exited": return color("✕", Colors.RED)
     if state in ("restarting", "created"): return color("↻", Colors.YELLOW)
-    return color("?", Colors.YELLOW)
+    return color("○", Colors.YELLOW)
 
 def fetch_project_data(projects, executor):
     sys.stdout.write(f"\r{color('⠋', Colors.CYAN)} {color('Discovering containers...', Colors.DIM)}\033[K")
@@ -34,13 +34,13 @@ def fetch_project_data(projects, executor):
 def cmd_status():
     projects = docker_api.find_projects()
     if not projects:
-        print(f"\n{color('🐳 DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+        print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
         return
 
     print()
     metrics = get_system_metrics()
-    print(color("🐳 DOCKY", Colors.BOLD + Colors.CYAN) + color("  ·  Server Status", Colors.DIM))
-    print(f"\n  💾 Storage : {metrics['disk_str']}\n  🐏 Memory  : {metrics['ram_str']}\n")
+    print(color("● DOCKY", Colors.BOLD + Colors.CYAN) + color("  ·  Server Status", Colors.DIM))
+    print(f"\n  ○ Storage : {metrics['disk_str']}\n  ○ Memory  : {metrics['ram_str']}\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         project_data = fetch_project_data(projects, executor)
@@ -66,14 +66,62 @@ def cmd_status():
 
     print(f"\n{color('●', Colors.GREEN)} {color(f'{running}/{total} containers running', Colors.DIM)}\n")
 
+
+def cmd_top():
+    projects = docker_api.find_projects()
+    if not projects:
+        return print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  Resource Monitor', Colors.DIM)}\n")
+
+    # Fetch stats quietly
+    sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Sampling system resources...', Colors.DIM)}\033[K")
+    sys.stdout.flush()
+    
+    succ, out, _ = run_command(["docker", "stats", "--no-stream", "--format", "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}"])
+    stats_map = {}
+    if succ:
+        for line in out.splitlines():
+            parts = line.split("|")
+            if len(parts) >= 3:
+                mem_clean = parts[2].split(" / ")[0] # Grabs just the used memory part (e.g. "150MiB")
+                stats_map[parts[0]] = {"cpu": parts[1], "mem": mem_clean}
+                
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
+        project_data = fetch_project_data(projects, executor)
+        
+    for p_idx, data in enumerate(project_data):
+        project, containers = data["project"], data["containers"]
+        is_last_p = (p_idx == len(project_data) - 1)
+        print(f"{'└─' if is_last_p else '├─'} {color(project['name'], Colors.CYAN + Colors.BOLD)}")
+
+        for c_idx, container in enumerate(containers):
+            is_last_c = (c_idx == len(containers) - 1)
+            prefix = f"{'   ' if is_last_p else '│  '}{'└─' if is_last_c else '├─'} "
+            
+            c_name = container["name"]
+            if container['state'].lower() == "running" and c_name in stats_map:
+                cpu = stats_map[c_name]["cpu"]
+                mem = stats_map[c_name]["mem"]
+                # Color code CPU usage for quick scanning (Red if > 50%, Yellow > 10%, else Dim)
+                cpu_val = float(cpu.replace('%', '')) if '%' in cpu else 0.0
+                cpu_color = Colors.RED if cpu_val > 50 else (Colors.YELLOW if cpu_val > 10 else Colors.DIM)
+                
+                stats_str = f"CPU: {color(f'{cpu:>6}', cpu_color)}  |  RAM: {color(f'{mem:>8}', Colors.CYAN)}"
+                print(f"{prefix}{container_indicator(container['state'])} {container['short_name']:<25} {stats_str}")
+            else:
+                print(f"{prefix}{container_indicator(container['state'])} {container['short_name']:<25} {color('Offline', Colors.DIM)}")
+    print()
+
+
 def cmd_updates(is_upgrade=False):
     projects = docker_api.find_projects()
     if not projects:
-        print(f"\n{color('🐳 DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
-        return
+        return print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+        
     print()
     title = "Upgrading Containers" if is_upgrade else "Image Updates"
-    print(color("🐳 DOCKY", Colors.BOLD + Colors.CYAN) + color(f"  ·  {title}", Colors.DIM) + "\n")
+    print(color("● DOCKY", Colors.BOLD + Colors.CYAN) + color(f"  ·  {title}", Colors.DIM) + "\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         project_data = [d for d in fetch_project_data(projects, executor) if d["containers"]]
@@ -152,14 +200,13 @@ def cmd_updates(is_upgrade=False):
 def cmd_sweep():
     metrics_before = get_system_metrics()
     
-    print(f"\n{color('🐳 DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  The Ghost Finder', Colors.DIM)}\n")
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  The Ghost Finder', Colors.DIM)}\n")
     sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Analyzing Docker filesystem...', Colors.DIM)}\033[K")
     sys.stdout.flush()
 
     succ, out, err = run_command(["docker", "system", "df"])
     if not succ:
-        print(f"\r{color('!', Colors.RED)} {color('Failed to analyze Docker filesystem.', Colors.RED)}\n{err}")
-        return
+        return print(f"\r{color('!', Colors.RED)} {color('Failed to analyze Docker filesystem.', Colors.RED)}\n{err}")
 
     data = {parts[0]: parts[4].split(" ")[0] for line in out.splitlines()[1:] if len(parts := re.split(r'\s{2,}', line.strip())) >= 5}
     
@@ -176,7 +223,7 @@ def cmd_sweep():
     _, out_c, _ = run_command(["docker", "ps", "-a", "-f", "status=exited", "-f", "status=created", "--format", "{{.Names}} - {{.Status}}"])
     stopped_containers = [line.strip() for line in out_c.splitlines() if line.strip()]
 
-    print(f"\r\033[K{color('👻 Ghost Data Found:', Colors.BOLD)}\n")
+    print(f"\r\033[K{color('○ Ghost Data Found:', Colors.BOLD)}\n")
     
     has_ghosts = False
     for key, label in [("Images", "Unused Images"), ("Containers", "Stopped Containers"), ("Local Volumes", "Orphaned Volumes"), ("Build Cache", "Build Cache")]:
@@ -185,8 +232,7 @@ def cmd_sweep():
         print(f"  {color('•', Colors.DIM)} {label:<20} {color(size, Colors.YELLOW) if size != '0B' else color('Clean', Colors.GREEN)}")
 
     if not has_ghosts:
-        print(f"\n{color('✓ Your system is completely clean! No ghosts found.', Colors.GREEN)}\n")
-        return
+        return print(f"\n{color('✓ Your system is completely clean! No ghosts found.', Colors.GREEN)}\n")
 
     if stopped_containers or unused_images:
         print("\n" + "─" * 55 + "\n" + color("Inspection Details:", Colors.BOLD))
@@ -226,15 +272,14 @@ def cmd_lifecycle(action, target):
     if target.lower() != "all":
         projects = [p for p in projects if p["name"].lower() == target.lower()]
         if not projects:
-            print(f"\n{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
-            return
+            return print(f"\n{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
     else:
-        print(f"\n{color(f'⚠️  WARNING: You are about to {action} ALL {len(projects)} projects.', Colors.YELLOW)}")
+        print(f"\n{color(f'! WARNING: You are about to {action} ALL {len(projects)} projects.', Colors.YELLOW)}")
         try: choice = input(color("[?] Proceed? (y/N): ", Colors.BOLD)).strip().lower()
         except EOFError: choice = 'n'
         if choice not in ['y', 'yes']: return print(f"\n{color('Aborted.', Colors.DIM)}\n")
 
-    print(f"\n{color('🐳 DOCKY', Colors.BOLD + Colors.CYAN)} {color(f'  ·  {action.capitalize()}ing Projects', Colors.DIM)}\n")
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color(f'  ·  {action.capitalize()}ing Projects', Colors.DIM)}\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         futures = {p["name"]: executor.submit(lambda prj: run_command(["docker", "compose", "-f", str(prj["compose"]), action]), p) for p in projects}
@@ -255,5 +300,5 @@ def cmd_lifecycle(action, target):
                 print(f"\r{prefix}{color('✓', Colors.GREEN)} {name:<20} {color(f'{action}ed', Colors.GREEN)}\033[K")
             else:
                 error_c += 1
-                print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color(f'failed', Colors.RED)}\033[K\n  {color(err, Colors.DIM)}")
+                print(f"\r{prefix}{color('✕', Colors.RED)} {name:<20} {color(f'failed', Colors.RED)}\033[K\n  {color(err, Colors.DIM)}")
     print()

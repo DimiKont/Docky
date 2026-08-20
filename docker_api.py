@@ -2,7 +2,7 @@
 import json
 import re
 from pathlib import Path
-from Docky.utils import run_command
+from utils import run_command
 
 DOCKER_ROOT = Path.home() / "docker"
 COMPOSE_FILENAMES = ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
