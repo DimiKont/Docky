@@ -30,6 +30,12 @@ def find_projects():
     projects.sort(key=lambda p: p["name"])
     return projects
 
+def derive_short_name(name, project_name):
+    prefix = f"{project_name}-"
+    short_name = name[len(prefix):] if name.startswith(prefix) else name
+    short_name = short_name[:-2] if short_name.endswith("-1") else short_name
+    return short_name
+
 def get_project_containers(project):
     success, output, _ = run_command(
         ["docker", "compose", "-f", str(project["compose"]), "ps", "-a", "--format", "{{.Name}}|{{.State}}|{{.Status}}|{{.Image}}|{{.Service}}"]
@@ -42,10 +48,8 @@ def get_project_containers(project):
         parts = line.split("|")
         if len(parts) < 4: continue
         name, state, status, image = parts[0], parts[1], parts[2], parts[3]
-        
-        prefix = f"{project['name']}-"
-        short_name = name[len(prefix):] if name.startswith(prefix) else name
-        short_name = short_name[:-2] if short_name.endswith("-1") else short_name
+
+        short_name = derive_short_name(name, project["name"])
         service = parts[4] if len(parts) >= 5 and parts[4] and "{{" not in parts[4] else short_name
 
         inspect_success, inspect_output, _ = run_command(["docker", "container", "inspect", name, "--format", "{{.Image}}|{{.Config.Image}}"])
@@ -55,6 +59,66 @@ def get_project_containers(project):
 
         containers.append({"name": name, "short_name": short_name, "state": state, "status": status, "image": config_image, "running_id": running_id, "service": service})
     return containers
+
+def get_containers_light(project):
+    """
+    Lightweight container listing for the live 'top' monitor.
+
+    get_project_containers() above does one `docker container
+    inspect` per container to resolve the real image reference --
+    needed for update checks, but wasted work on a view that just
+    refreshed a second ago. This version is just `docker compose
+    ps` with two fields, so it stays cheap enough to re-run every
+    refresh tick.
+    """
+    success, output, _ = run_command(
+        ["docker", "compose", "-f", str(project["compose"]), "ps", "-a", "--format", "{{.Name}}|{{.State}}"]
+    )
+    if not success:
+        return []
+
+    containers = []
+    for line in output.splitlines():
+        parts = line.split("|")
+        if len(parts) < 2:
+            continue
+        name, state = parts[0], parts[1]
+        containers.append({
+            "name": name,
+            "short_name": derive_short_name(name, project["name"]),
+            "state": state,
+        })
+    return containers
+
+def fetch_stats():
+    """
+    One-shot snapshot of live resource usage for every running
+    container on the host. This is a single `docker stats` call
+    regardless of how many projects or containers exist -- it's
+    what keeps each refresh tick of the live monitor cheap.
+    """
+    success, output, _ = run_command([
+        "docker", "stats", "--no-stream", "--format",
+        "{{.Name}}|{{.CPUPerc}}|{{.MemUsage}}|{{.MemPerc}}|{{.NetIO}}|{{.BlockIO}}",
+    ])
+
+    stats_map = {}
+    if not success:
+        return stats_map
+
+    for line in output.splitlines():
+        parts = line.split("|")
+        if len(parts) < 6:
+            continue
+        name, cpu, mem_usage, mem_pct, net, blk = parts[:6]
+        stats_map[name] = {
+            "cpu": cpu,
+            "mem_used": mem_usage.split(" / ")[0],
+            "mem_pct": mem_pct,
+            "net": net,
+            "blk": blk,
+        }
+    return stats_map
 
 def get_local_image_id(image):
     succ, out, err = run_command(["docker", "image", "inspect", image, "--format", "{{.Id}}"])

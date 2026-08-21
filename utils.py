@@ -19,6 +19,17 @@ def run_command(command):
     result = subprocess.run(command, capture_output=True, text=True)
     return (result.returncode == 0, result.stdout.strip(), result.stderr.strip())
 
+def parse_pct(value):
+    try:
+        return float(value.replace('%', '').strip())
+    except (ValueError, AttributeError):
+        return 0.0
+
+def render_bar(pct, width=10):
+    pct = max(0.0, min(100.0, pct))
+    filled = round((pct / 100) * width)
+    return "▓" * filled + "░" * (width - filled)
+
 def get_system_metrics():
     # Disk space on root (/)
     total, used, free = shutil.disk_usage("/")
