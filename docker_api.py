@@ -1,6 +1,7 @@
 # docker_api.py
 import json
 import re
+import time
 from pathlib import Path
 from utils import run_command
 
@@ -173,3 +174,159 @@ def upgrade_service(compose_file, service_name):
     succ, _, err = run_command(["docker", "compose", "-f", str(compose_file), "up", "-d", service_name])
     if not succ: return False, f"up failed: {err}"
     return True, ""
+
+def verify_container_health(container_name, healthcheck_timeout=30, no_healthcheck_grace=6, poll_interval=1.0):
+    """
+    Confirm a container actually came back up cleanly after
+    'up -d', rather than trusting the command's exit code alone --
+    a container can be recreated successfully and still crash-loop
+    or fail its healthcheck seconds later.
+
+    Containers WITH a healthcheck get the full timeout, since some
+    apps (databases warming up, etc.) legitimately take a while to
+    report their first result. Containers WITHOUT one only get a
+    short grace window -- most real startup failures (bad env var,
+    port conflict, permission error) show up as an exit or a
+    restart within the first couple seconds, so there's no reason
+    to burn the full 30s waiting on something that was never going
+    to report "healthy" in the first place.
+
+    Returns:
+        (ok: bool, detail: str)
+    """
+    def inspect_once():
+        success, output, _ = run_command([
+            "docker", "inspect", container_name,
+            "--format",
+            "{{.State.Status}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}",
+        ])
+        if not success or "|" not in output:
+            return None
+        status, restarts_str, health = output.split("|", 2)
+        restarts = int(restarts_str) if restarts_str.isdigit() else 0
+        return status, restarts, health
+
+    reading = inspect_once()
+    if reading is None:
+        return False, "could not inspect container"
+
+    status, baseline_restarts, health = reading
+    has_healthcheck = health != "none"
+    timeout = healthcheck_timeout if has_healthcheck else no_healthcheck_grace
+    deadline = time.time() + timeout
+    restarts = baseline_restarts
+
+    while True:
+        if status == "exited":
+            return False, "container exited shortly after starting"
+
+        if health == "unhealthy":
+            return False, "healthcheck reports unhealthy"
+
+        if restarts > baseline_restarts + 1:
+            return False, f"container is restart-looping ({restarts} restarts)"
+
+        if health == "healthy":
+            return True, "healthcheck passed"
+
+        if time.time() >= deadline:
+            break
+
+        time.sleep(poll_interval)
+        reading = inspect_once()
+        if reading is not None:
+            status, restarts, health = reading
+
+    if has_healthcheck:
+        if health == "starting":
+            return False, "healthcheck did not become healthy in time"
+        return False, f"container did not stabilize (status: {status})"
+
+    if status == "running":
+        return True, "running (no healthcheck defined)"
+    return False, f"container did not stabilize (status: {status})"
+
+def get_volume_sizes():
+    """
+    Parse `docker system df -v` for real per-volume disk usage.
+
+    This is the only place Docker exposes volume sizes at all --
+    `docker volume ls` has no size field, since computing it means
+    walking the filesystem. That's also why this is only ever
+    called for an on-demand report like orphan detection, never on
+    a refresh loop like 'top'.
+    """
+    success, output, _ = run_command(["docker", "system", "df", "-v"])
+    if not success:
+        return {}
+
+    sizes = {}
+    state = "seek_section"
+
+    for line in output.splitlines():
+        stripped = line.strip()
+
+        if state == "seek_section":
+            if stripped.startswith("Local Volumes"):
+                state = "seek_header"
+            continue
+
+        if state == "seek_header":
+            if stripped.startswith("VOLUME NAME"):
+                state = "data"
+            continue
+
+        if state == "data":
+            if not stripped:
+                break
+            columns = stripped.split()
+            if len(columns) >= 3:
+                sizes[columns[0]] = columns[-1]
+
+    return sizes
+
+def get_all_volumes():
+    """
+    Every volume on the host, with its Compose project label (if
+    Compose created it) and on-disk size (if Docker has already
+    computed one).
+
+    A volume's "project" here is the value Compose stamped on it
+    at creation time -- it's what lets orphan detection tell "this
+    volume belongs to a project that still exists" apart from
+    "this volume's project folder is gone."
+    """
+    success, output, _ = run_command(
+        ["docker", "volume", "ls", "--format", "{{.Name}}|{{.Labels}}"]
+    )
+    if not success:
+        return []
+
+    volumes = []
+    for line in output.splitlines():
+        if not line:
+            continue
+        parts = line.split("|", 1)
+        name = parts[0]
+        labels_str = parts[1] if len(parts) > 1 else ""
+
+        labels = {}
+        for pair in labels_str.split(","):
+            if "=" in pair:
+                key, _, value = pair.partition("=")
+                labels[key.strip()] = value.strip()
+
+        volumes.append({
+            "name": name,
+            "project": labels.get("com.docker.compose.project"),
+        })
+
+    sizes = get_volume_sizes()
+    for volume in volumes:
+        volume["size"] = sizes.get(volume["name"])
+
+    return volumes
+
+def remove_volume(name):
+    success, _, err = run_command(["docker", "volume", "rm", name])
+    return success, err

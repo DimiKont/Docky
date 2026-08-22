@@ -15,6 +15,7 @@ def show_usage():
         ("updates", "Check for available image updates"),
         ("upgrade", "Automatically pull and recreate outdated containers"),
         ("sweep", "Find and safely clear ghost data & unused images"),
+        ("orphans", "Find volumes belonging to deleted or renamed projects"),
         ("start <name|all>", "Start a specific project or 'all'"),
         ("stop <name|all>", "Stop a specific project or 'all'"),
         ("restart <name|all>", "Restart a specific project or 'all'")
@@ -34,6 +35,7 @@ def main():
         elif cmd in ("updates", "update"): commands.cmd_updates(is_upgrade=False)
         elif cmd == "upgrade": commands.cmd_updates(is_upgrade=True)
         elif cmd == "sweep": commands.cmd_sweep()
+        elif cmd == "orphans": commands.cmd_orphans()
         elif cmd in ("start", "stop", "restart"):
             if len(sys.argv) < 3:
                 print(f"\n{color('! Missing target.', Colors.RED)}\nUsage: {color(f'docky {cmd} <project_name|all>', Colors.BOLD)}\n")

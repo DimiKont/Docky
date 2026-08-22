@@ -190,6 +190,7 @@ def cmd_updates(is_upgrade=False):
 
         total_cur, total_upd, total_upg, total_err = 0, 0, 0, 0
         errors = []
+        unstable = []
 
         for p_idx, data in enumerate(project_data):
             project, containers = data["project"], data["containers"]
@@ -224,12 +225,27 @@ def cmd_updates(is_upgrade=False):
                             sys.stdout.flush()
                             idx += 1; time.sleep(0.08)
                         success, err_msg = upg_future.result()
-                        if success:
-                            total_upg += 1
-                            print(f"\r{prefix}{color('✓', Colors.GREEN)} {name:<20} {color('upgraded', Colors.GREEN)}\033[K")
-                        else:
+
+                        if not success:
                             total_err += 1; errors.append((name, err_msg))
                             print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgrade failed', Colors.RED)}\033[K")
+                        else:
+                            # The command succeeding doesn't mean the
+                            # container actually came back up cleanly --
+                            # confirm it before calling this a success.
+                            verify_future = executor.submit(docker_api.verify_container_health, container["name"])
+                            while not verify_future.done():
+                                sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color('verifying health...', Colors.CYAN)}\033[K")
+                                sys.stdout.flush()
+                                idx += 1; time.sleep(0.08)
+                            ok, detail = verify_future.result()
+
+                            if ok:
+                                total_upg += 1
+                                print(f"\r{prefix}{color('✓', Colors.GREEN)} {name:<20} {color('upgraded & verified', Colors.GREEN)}\033[K")
+                            else:
+                                total_err += 1; unstable.append((name, detail))
+                                print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgraded but unstable', Colors.RED)}\033[K")
                     else:
                         total_upd += 1
                         print(f"\r{prefix}{color('↑', Colors.YELLOW)} {name:<20} {color('update available', Colors.YELLOW)}\033[K")
@@ -246,13 +262,22 @@ def cmd_updates(is_upgrade=False):
         if errors:
             print("\n" + color("Check details:", Colors.BOLD))
             for item, err in errors: print(f"  {color('!', Colors.RED)} {item}\n    {color(err, Colors.DIM)}")
-        
+
+        if unstable:
+            print("\n" + color("Upgraded but did not verify as healthy:", Colors.BOLD))
+            for item, detail in unstable: print(f"  {color('!', Colors.RED)} {item}\n    {color(detail, Colors.DIM)}")
+            print(color("  The previous image for these was kept, in case you need to roll back manually.", Colors.DIM))
+
         if is_upgrade and total_upg > 0:
             print()
-            sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Cleaning up old images...', Colors.DIM)}\033[K")
-            sys.stdout.flush()
-            run_command(["docker", "image", "prune", "-f"])
-            sys.stdout.write(f"\r{color('✓', Colors.GREEN)} {color('Cleaned up old images.', Colors.DIM)}\033[K\n")
+            if unstable:
+                print(color("○ Skipping image cleanup -- at least one upgrade this run wasn't verified healthy.", Colors.YELLOW))
+                print(color("  Fix or roll back the container(s) above, then re-run 'docky sweep' when you're ready to reclaim space.", Colors.DIM))
+            else:
+                sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Cleaning up old images...', Colors.DIM)}\033[K")
+                sys.stdout.flush()
+                run_command(["docker", "image", "prune", "-f"])
+                sys.stdout.write(f"\r{color('✓', Colors.GREEN)} {color('Cleaned up old images.', Colors.DIM)}\033[K\n")
         print()
 
 def cmd_sweep():
@@ -359,4 +384,78 @@ def cmd_lifecycle(action, target):
             else:
                 error_c += 1
                 print(f"\r{prefix}{color('✕', Colors.RED)} {name:<20} {color(f'failed', Colors.RED)}\033[K\n  {color(err, Colors.DIM)}")
+    print()
+
+def cmd_orphans():
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  Orphaned Volumes', Colors.DIM)}\n")
+    sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Scanning volumes...', Colors.DIM)}\033[K")
+    sys.stdout.flush()
+
+    projects = docker_api.find_projects()
+    known_project_names = {p["name"] for p in projects}
+
+    all_volumes = docker_api.get_all_volumes()
+
+    # "Orphaned" = Compose stamped this volume with a project name,
+    # and no folder by that name exists under DOCKER_ROOT anymore.
+    # Volumes with no project label at all weren't created by
+    # Compose (or predate this labeling) -- we can't safely reason
+    # about ownership for those, so they're surfaced as a count
+    # only, never flagged or touched.
+    orphaned = [v for v in all_volumes if v["project"] and v["project"] not in known_project_names]
+    unmanaged = [v for v in all_volumes if not v["project"]]
+
+    print(f"\r\033[K{color('○ Scan complete', Colors.BOLD)}\n")
+
+    if not orphaned:
+        print(color("✓ No orphaned volumes found.", Colors.GREEN))
+        if unmanaged:
+            count = len(unmanaged)
+            print(color(f"  ({count} volume{'s' if count != 1 else ''} not managed by Compose -- ownership unclear, not checked)", Colors.DIM))
+        print()
+        return
+
+    count = len(orphaned)
+    print(color(f"Found {count} volume{'s' if count != 1 else ''} whose project no longer exists:", Colors.BOLD))
+    print()
+
+    for v in orphaned:
+        size_str = v["size"] or "unknown size"
+        label = f"(was: {v['project']})"
+        print(f"  {color('✕', Colors.RED)} {v['name']:<32} {label:<26} {color(size_str, Colors.YELLOW)}")
+
+    print()
+    print(color(f"These belong to project folders no longer under {docker_api.DOCKER_ROOT}", Colors.DIM))
+    print(color("-- likely deleted or renamed projects.", Colors.DIM))
+    print()
+
+    if unmanaged:
+        u_count = len(unmanaged)
+        verb = "aren't" if u_count != 1 else "isn't"
+        print(color(f"({u_count} other volume{'s' if u_count != 1 else ''} {verb} Compose-managed and weren't checked.)", Colors.DIM))
+        print()
+
+    try:
+        choice = input(color(f"[?] Remove these {count} volume(s)? This deletes their data permanently. (y/N): ", Colors.BOLD)).strip().lower()
+    except EOFError:
+        choice = 'n'
+
+    if choice not in ('y', 'yes'):
+        return print(f"\n{color('Aborted. No volumes were removed.', Colors.DIM)}\n")
+
+    print()
+    removed, failed = 0, []
+    for v in orphaned:
+        success, err = docker_api.remove_volume(v["name"])
+        if success:
+            print(f"  {color('✓', Colors.GREEN)} Removed {v['name']}")
+            removed += 1
+        else:
+            print(f"  {color('!', Colors.RED)} Failed to remove {v['name']}: {color(err, Colors.DIM)}")
+            failed.append(v["name"])
+
+    print()
+    print(color(f"{removed} volume{'s' if removed != 1 else ''} removed.", Colors.GREEN))
+    if failed:
+        print(color(f"{len(failed)} could not be removed (likely still in use by a container).", Colors.RED))
     print()
