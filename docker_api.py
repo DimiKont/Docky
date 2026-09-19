@@ -31,6 +31,33 @@ def find_projects():
     projects.sort(key=lambda p: p["name"])
     return projects
 
+def sanitize_project_name(name):
+    """Compose's own normalisation: lowercase, keep only [a-z0-9_-]."""
+    return re.sub(r"[^a-z0-9_-]", "", name.lower())
+
+def resolve_project_names(project):
+    """
+    Every name Compose could have stamped on this project's volumes.
+
+    The folder name alone isn't reliable: Compose sanitizes it
+    ("My App" -> "myapp") and a `name:` key in the compose file (or
+    COMPOSE_PROJECT_NAME) overrides it entirely. Ask Compose for the
+    real name, and keep the sanitized folder name as a fallback so a
+    failed lookup only ever widens what counts as "known".
+    """
+    names = {project["name"], sanitize_project_name(project["name"])}
+    success, output, _ = run_command(
+        ["docker", "compose", "-f", str(project["compose"]), "config", "--format", "json"]
+    )
+    if success and output:
+        try:
+            resolved = json.loads(output).get("name")
+            if resolved:
+                names.add(resolved)
+        except json.JSONDecodeError:
+            pass
+    return names
+
 def derive_short_name(name, project_name):
     prefix = f"{project_name}-"
     short_name = name[len(prefix):] if name.startswith(prefix) else name

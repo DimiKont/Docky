@@ -392,7 +392,19 @@ def cmd_orphans():
     sys.stdout.flush()
 
     projects = docker_api.find_projects()
-    known_project_names = {p["name"] for p in projects}
+
+    # With no projects discovered, every Compose volume would look
+    # orphaned. That's almost always a wrong/missing/unmounted
+    # DOCKER_ROOT, not a real cleanup opportunity -- refuse to guess.
+    if not projects:
+        return print(
+            f"\r\033[K{color('!', Colors.RED)} {color(f'No Compose projects found under {docker_api.DOCKER_ROOT}.', Colors.RED)}\n"
+            + color("  Refusing to check for orphans: every volume would be flagged. Is the directory missing or unmounted?", Colors.DIM) + "\n"
+        )
+
+    known_project_names = set()
+    for p in projects:
+        known_project_names |= docker_api.resolve_project_names(p)
 
     all_volumes = docker_api.get_all_volumes()
 
@@ -436,16 +448,30 @@ def cmd_orphans():
         print()
 
     try:
-        choice = input(color(f"[?] Remove these {count} volume(s)? This deletes their data permanently. (y/N): ", Colors.BOLD)).strip().lower()
+        choice = input(color("[?] Remove volumes? This deletes their data permanently. [a]ll / [s]elect / [N]one: ", Colors.BOLD)).strip().lower()
     except EOFError:
         choice = 'n'
 
-    if choice not in ('y', 'yes'):
+    if choice in ('a', 'all'):
+        to_remove = orphaned
+    elif choice in ('s', 'select'):
+        to_remove = []
+        for v in orphaned:
+            try:
+                answer = input(f"  Remove {color(v['name'], Colors.BOLD)} ({v['size'] or 'unknown size'})? (y/N): ").strip().lower()
+            except EOFError:
+                break
+            if answer in ('y', 'yes'):
+                to_remove.append(v)
+    else:
+        to_remove = []
+
+    if not to_remove:
         return print(f"\n{color('Aborted. No volumes were removed.', Colors.DIM)}\n")
 
     print()
     removed, failed = 0, []
-    for v in orphaned:
+    for v in to_remove:
         success, err = docker_api.remove_volume(v["name"])
         if success:
             print(f"  {color('✓', Colors.GREEN)} Removed {v['name']}")

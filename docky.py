@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # docky.py
 
+import shutil
 import sys
-from utils import Colors, color
+from utils import Colors, color, run_command
 import commands
 
 def show_usage():
@@ -24,12 +25,28 @@ def show_usage():
         print(f"  {color(cmd, Colors.CYAN):<28} {desc}")
     print()
 
+def preflight():
+    """Fail with a readable message if Docker isn't installed or reachable."""
+    if shutil.which("docker") is None:
+        print(f"\n{color('! Docker was not found in PATH.', Colors.RED)}\n  Install Docker first: {color('https://docs.docker.com/engine/install/', Colors.DIM)}\n")
+        return False
+    ok, _, err = run_command(["docker", "info", "--format", "{{.ServerVersion}}"])
+    if not ok:
+        hint = "You may need to add your user to the 'docker' group, or use sudo." if "permission denied" in err.lower() else "Is the Docker daemon running?"
+        print(f"\n{color('! Cannot talk to the Docker daemon.', Colors.RED)}\n  {color(hint, Colors.DIM)}\n")
+        return False
+    return True
+
 def main():
     try:
         if len(sys.argv) < 2:
             return show_usage()
-            
+
         cmd = sys.argv[1].lower()
+        if cmd not in ("help", "-h", "--help") and not preflight():
+            sys.exit(1)
+        if cmd in ("help", "-h", "--help"):
+            return show_usage()
         if cmd == "status": commands.cmd_status()
         elif cmd == "top": commands.cmd_top()
         elif cmd in ("updates", "update"): commands.cmd_updates(is_upgrade=False)
