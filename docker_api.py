@@ -165,7 +165,13 @@ def check_image_via_pull(image):
     status = "current" if local_id_before == local_id_after else "update"
     return {"status": status, "local": local_id_before, "remote": local_id_after, "local_id": local_id_after, "error": None, "checked_via": "pull"}
 
-def check_image(image):
+def check_image(image, allow_pull=True):
+    """
+    Compare local vs. registry digest. When digests can't be
+    compared, the fallback is a real `docker pull`, which changes
+    local state -- pass allow_pull=False (dry runs) to report
+    "unknown" instead of mutating anything.
+    """
     local_id, _ = get_local_image_id(image)
     
     succ, out, _ = run_command(["docker", "image", "inspect", image, "--format", "{{json .RepoDigests}}"])
@@ -188,6 +194,9 @@ def check_image(image):
                 break
 
     if not local_digest or not remote_digest:
+        if not allow_pull:
+            return {"status": "unknown", "local": local_digest, "remote": remote_digest, "local_id": local_id,
+                    "error": "digests unavailable; verifying would require pulling", "checked_via": "none"}
         res = check_image_via_pull(image)
         if res.get("local_id") is None: res["local_id"] = local_id
         return res

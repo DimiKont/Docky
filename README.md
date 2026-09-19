@@ -23,7 +23,7 @@ docky <command> [target]
 | `status` | Show Docker projects, containers, and system metrics |
 | `top` | Live CPU and RAM usage mapped to your projects |
 | `updates` | Check for available image updates |
-| `upgrade` | Pull and recreate outdated containers, verifying health |
+| `upgrade [name] [--dry-run]` | Pull and recreate outdated containers, verifying health. Give a project name to upgrade just that one; `--dry-run` shows the plan without changing anything |
 | `sweep` | Find and clear stopped containers and unused images |
 | `orphans` | Find volumes belonging to deleted or renamed projects |
 | `start` / `stop` / `restart` `<name\|all>` | Control a project or all of them |

@@ -14,7 +14,7 @@ def show_usage():
         ("status", "Show Docker projects, containers, and system metrics"),
         ("top", "Show real-time CPU and RAM usage mapped to your projects"),
         ("updates", "Check for available image updates"),
-        ("upgrade", "Automatically pull and recreate outdated containers"),
+        ("upgrade [name] [--dry-run]", "Pull and recreate outdated containers (all, or one project)"),
         ("sweep", "Find and safely clear ghost data & unused images"),
         ("orphans", "Find volumes belonging to deleted or renamed projects"),
         ("start <name|all>", "Start a specific project or 'all'"),
@@ -22,7 +22,7 @@ def show_usage():
         ("restart <name|all>", "Restart a specific project or 'all'")
     ]
     for cmd, desc in cmds:
-        print(f"  {color(cmd, Colors.CYAN):<28} {desc}")
+        print(f"  {color(f'{cmd:<28}', Colors.CYAN)} {desc}")
     print()
 
 def preflight():
@@ -50,7 +50,11 @@ def main():
         if cmd == "status": commands.cmd_status()
         elif cmd == "top": commands.cmd_top()
         elif cmd in ("updates", "update"): commands.cmd_updates(is_upgrade=False)
-        elif cmd == "upgrade": commands.cmd_updates(is_upgrade=True)
+        elif cmd == "upgrade":
+            args = sys.argv[2:]
+            dry_run = any(a in ("--dry-run", "-n") for a in args)
+            target = next((a for a in args if not a.startswith("-")), None)
+            commands.cmd_updates(is_upgrade=True, target=target, dry_run=dry_run)
         elif cmd == "sweep": commands.cmd_sweep()
         elif cmd == "orphans": commands.cmd_orphans()
         elif cmd in ("start", "stop", "restart"):

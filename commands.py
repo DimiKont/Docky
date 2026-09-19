@@ -172,13 +172,20 @@ def cmd_top():
     print(color("  Monitor stopped.", Colors.DIM) + "\n")
 
 
-def cmd_updates(is_upgrade=False):
+def cmd_updates(is_upgrade=False, target=None, dry_run=False):
     projects = docker_api.find_projects()
     if not projects:
         return print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
-        
+
+    if target:
+        projects = [p for p in projects if p["name"].lower() == target.lower()]
+        if not projects:
+            return print(f"\n{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
+
     print()
-    title = "Upgrading Containers" if is_upgrade else "Image Updates"
+    title = "Image Updates"
+    if is_upgrade:
+        title = "Upgrade Plan (dry run)" if dry_run else "Upgrading Containers"
     print(color("● DOCKY", Colors.BOLD + Colors.CYAN) + color(f"  ·  {title}", Colors.DIM) + "\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
@@ -186,9 +193,9 @@ def cmd_updates(is_upgrade=False):
         if not project_data: return
 
         unique_images = {c["image"] for d in project_data for c in d["containers"]}
-        image_futures = {img: executor.submit(docker_api.check_image, img) for img in unique_images}
+        image_futures = {img: executor.submit(docker_api.check_image, img, is_upgrade and not dry_run) for img in unique_images}
 
-        total_cur, total_upd, total_upg, total_err = 0, 0, 0, 0
+        total_cur, total_upd, total_upg, total_err, total_unk = 0, 0, 0, 0, 0
         errors = []
         unstable = []
 
@@ -217,8 +224,11 @@ def cmd_updates(is_upgrade=False):
                 if status == "current":
                     total_cur += 1
                     print(f"\r{prefix}{color('✓', Colors.GREEN)} {name:<20} {color('up to date', Colors.DIM)}\033[K")
+                elif status == "unknown":
+                    total_unk += 1
+                    print(f"\r{prefix}{color('?', Colors.YELLOW)} {name:<20} {color('cannot verify without pulling', Colors.DIM)}\033[K")
                 elif status == "update":
-                    if is_upgrade:
+                    if is_upgrade and not dry_run:
                         upg_future = executor.submit(docker_api.upgrade_service, project["compose"], container["service"])
                         while not upg_future.done():
                             sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color('pulling & recreating...', Colors.YELLOW)}\033[K")
@@ -248,7 +258,8 @@ def cmd_updates(is_upgrade=False):
                                 print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgraded but unstable', Colors.RED)}\033[K")
                     else:
                         total_upd += 1
-                        print(f"\r{prefix}{color('↑', Colors.YELLOW)} {name:<20} {color('update available', Colors.YELLOW)}\033[K")
+                        label = "would upgrade" if dry_run else "update available"
+                        print(f"\r{prefix}{color('↑', Colors.YELLOW)} {name:<20} {color(label, Colors.YELLOW)}\033[K")
                 else:
                     total_err += 1; errors.append((container["image"], res["error"]))
                     print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('check failed', Colors.RED)}\033[K")
@@ -256,7 +267,10 @@ def cmd_updates(is_upgrade=False):
         print("\n" + "─" * 55)
         print(color(f"✓ {total_cur} up to date", Colors.GREEN))
         if is_upgrade and total_upg: print(color(f"✓ {total_upg} upgraded successfully", Colors.GREEN))
-        elif total_upd: print(color(f"↑ {total_upd} update(s) available", Colors.YELLOW))
+        elif total_upd:
+            noun = "would be upgraded (dry run, nothing changed)" if dry_run else "update(s) available"
+            print(color(f"↑ {total_upd} {noun}", Colors.YELLOW))
+        if total_unk: print(color(f"? {total_unk} could not be verified without pulling", Colors.DIM))
         if total_err: print(color(f"! {total_err} error(s)", Colors.RED))
         
         if errors:
