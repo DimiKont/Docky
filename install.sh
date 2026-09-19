@@ -5,14 +5,21 @@
 # Environment overrides:
 #   DOCKY_REF      git branch or tag to install (default: main)
 #   DOCKY_HOME     where the files go (default: ~/.local/share/docky)
-#   DOCKY_BIN_DIR  where the `docky` command is linked (default: ~/.local/bin)
+#   DOCKY_BIN_DIR  where the `docky` command is linked
+#                  (default: /usr/local/bin as root, otherwise ~/.local/bin)
+#   DOCKY_NO_MODIFY_PATH=1  don't edit your shell profile to add BIN_DIR to PATH
 
 set -eu
 
 REPO="DimiKont/Docky"
 REF="${DOCKY_REF:-main}"
 INSTALL_DIR="${DOCKY_HOME:-$HOME/.local/share/docky}"
-BIN_DIR="${DOCKY_BIN_DIR:-$HOME/.local/bin}"
+if [ "$(id -u)" -eq 0 ]; then
+  DEFAULT_BIN_DIR="/usr/local/bin"
+else
+  DEFAULT_BIN_DIR="$HOME/.local/bin"
+fi
+BIN_DIR="${DOCKY_BIN_DIR:-$DEFAULT_BIN_DIR}"
 
 say()  { printf '\033[36m●\033[0m %s\n' "$1"; }
 warn() { printf '\033[33m!\033[0m %s\n' "$1"; }
@@ -55,8 +62,26 @@ say "Installed: $BIN_DIR/docky"
 
 case ":$PATH:" in
   *":$BIN_DIR:"*) ;;
-  *) warn "$BIN_DIR is not in your PATH. Add this to your shell profile:"
-     printf '    export PATH="%s:$PATH"\n' "$BIN_DIR" ;;
+  *)
+    # A PATH change typed into a terminal dies with that terminal, so
+    # persist it in the shell's startup file instead.
+    case "${SHELL:-}" in
+      */zsh)  RC="$HOME/.zshrc" ;;
+      */bash) RC="$HOME/.bashrc" ;;
+      *)      RC="$HOME/.profile" ;;
+    esac
+    LINE="export PATH=\"$BIN_DIR:\$PATH\""
+    if [ "${DOCKY_NO_MODIFY_PATH:-0}" = "1" ]; then
+      warn "$BIN_DIR is not in your PATH. Add this to your shell profile:"
+      printf '    %s\n' "$LINE"
+    else
+      if ! grep -qsF "$LINE" "$RC"; then
+        printf '\n# Added by the Docky installer\n%s\n' "$LINE" >> "$RC"
+      fi
+      say "Added $BIN_DIR to your PATH in $RC"
+      warn "Open a new terminal (or run: source $RC) to use 'docky'."
+    fi
+    ;;
 esac
 
 say "Run 'docky' to get started."
