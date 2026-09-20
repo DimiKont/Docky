@@ -1,7 +1,10 @@
 # docker_api.py
 import json
+import os
 import re
+import subprocess
 import time
+from datetime import datetime
 from pathlib import Path
 from utils import run_command
 
@@ -210,6 +213,90 @@ def upgrade_service(compose_file, service_name):
     succ, _, err = run_command(["docker", "compose", "-f", str(compose_file), "up", "-d", service_name])
     if not succ: return False, f"up failed: {err}"
     return True, ""
+
+ROLLBACK_LABEL = "docky.rollback"
+
+def rollback_state_path():
+    base = os.environ.get("XDG_STATE_HOME") or (Path.home() / ".local" / "state")
+    return Path(base) / "docky" / "rollback.json"
+
+def load_rollback_state():
+    try:
+        return json.loads(rollback_state_path().read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_rollback_state(state):
+    path = rollback_state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(path)
+
+def rollback_tag(project_name, service):
+    return f"docky-rollback/{sanitize_project_name(project_name)}-{sanitize_project_name(service)}:previous"
+
+def snapshot_service(project, container):
+    """
+    Keep a copy of the image a service is running right now, so a
+    bad upgrade can be undone. Only one level is kept per service.
+
+    A bare tag would stop the old image from being pruned as
+    dangling, but `docker system prune -a` (used by sweep) would
+    still remove it, so the snapshot is rebuilt with a label
+    (metadata only, no new layers) that sweep filters on.
+    """
+    image_id = container.get("running_id")
+    if not image_id:
+        return False
+    tag = rollback_tag(project["name"], container["service"])
+    succ, _, _ = run_command(["docker", "tag", image_id, tag])
+    if not succ:
+        return False
+    result = subprocess.run(
+        ["docker", "build", "-q", "--label", f"{ROLLBACK_LABEL}=true", "-t", tag, "-"],
+        input=f"FROM {tag}\n", capture_output=True, text=True,
+    )
+    labelled = result.returncode == 0
+
+    state = load_rollback_state()
+    state.setdefault(project["name"], {})[container["service"]] = {
+        "image": container["image"],
+        "tag": tag,
+        "previous_id": image_id,
+        "protected": labelled,
+        "saved_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    save_rollback_state(state)
+    return True
+
+def rollback_service(project, service, entry):
+    """Point the service's image reference back at the snapshot and recreate it."""
+    image_ref = entry["image"]
+    if "@" in image_ref:
+        return False, "image is pinned by digest in the compose file; edit it there instead"
+    succ, _, _ = run_command(["docker", "image", "inspect", entry["tag"]])
+    if not succ:
+        return False, "the saved image no longer exists (it was removed from Docker)"
+    succ, _, err = run_command(["docker", "tag", entry["tag"], image_ref])
+    if not succ:
+        return False, f"tag failed: {err}"
+    succ, _, err = run_command([
+        "docker", "compose", "-f", str(project["compose"]),
+        "up", "-d", "--no-deps", "--pull", "never", service,
+    ])
+    if not succ:
+        return False, f"up failed: {err}"
+    return True, ""
+
+def forget_snapshot(project_name, service):
+    state = load_rollback_state()
+    entry = state.get(project_name, {}).pop(service, None)
+    if not state.get(project_name, True):
+        state.pop(project_name, None)
+    save_rollback_state(state)
+    if entry:
+        run_command(["docker", "rmi", entry["tag"]])
 
 def verify_container_health(container_name, healthcheck_timeout=30, no_healthcheck_grace=6, poll_interval=1.0):
     """

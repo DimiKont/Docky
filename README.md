@@ -24,6 +24,7 @@ docky <command> [target]
 | `top` | Live CPU and RAM usage mapped to your projects |
 | `updates` | Check for available image updates |
 | `upgrade [name] [--dry-run]` | Pull and recreate outdated containers, verifying health. Give a project name to upgrade just that one; `--dry-run` shows the plan without changing anything |
+| `rollback [name] [service]` | Undo the last upgrade. Docky saves the previous image before every upgrade; with no arguments this lists the saved snapshots |
 | `sweep` | Find and clear stopped containers and unused images |
 | `orphans` | Find volumes belonging to deleted or renamed projects |
 | `start` / `stop` / `restart` `<name\|all>` | Control a project or all of them |

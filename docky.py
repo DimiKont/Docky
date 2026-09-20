@@ -15,6 +15,7 @@ def show_usage():
         ("top", "Show real-time CPU and RAM usage mapped to your projects"),
         ("updates", "Check for available image updates"),
         ("upgrade [name] [--dry-run]", "Pull and recreate outdated containers (all, or one project)"),
+        ("rollback [name] [service]", "Undo the last upgrade (no args: list saved snapshots)"),
         ("sweep", "Find and safely clear ghost data & unused images"),
         ("orphans", "Find volumes belonging to deleted or renamed projects"),
         ("start <name|all>", "Start a specific project or 'all'"),
@@ -55,6 +56,9 @@ def main():
             dry_run = any(a in ("--dry-run", "-n") for a in args)
             target = next((a for a in args if not a.startswith("-")), None)
             commands.cmd_updates(is_upgrade=True, target=target, dry_run=dry_run)
+        elif cmd == "rollback":
+            args = [a for a in sys.argv[2:] if not a.startswith("-")]
+            commands.cmd_rollback(*(args[:2]))
         elif cmd == "sweep": commands.cmd_sweep()
         elif cmd == "orphans": commands.cmd_orphans()
         elif cmd in ("start", "stop", "restart"):
