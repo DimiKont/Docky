@@ -229,6 +229,7 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                     print(f"\r{prefix}{color('?', Colors.YELLOW)} {name:<20} {color('cannot verify without pulling', Colors.DIM)}\033[K")
                 elif status == "update":
                     if is_upgrade and not dry_run:
+                        docker_api.snapshot_service(project, container)
                         upg_future = executor.submit(docker_api.upgrade_service, project["compose"], container["service"])
                         while not upg_future.done():
                             sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color('pulling & recreating...', Colors.YELLOW)}\033[K")
@@ -254,7 +255,7 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                                 total_upg += 1
                                 print(f"\r{prefix}{color('✓', Colors.GREEN)} {name:<20} {color('upgraded & verified', Colors.GREEN)}\033[K")
                             else:
-                                total_err += 1; unstable.append((name, detail))
+                                total_err += 1; unstable.append((name, detail, project["name"]))
                                 print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgraded but unstable', Colors.RED)}\033[K")
                     else:
                         total_upd += 1
@@ -279,8 +280,9 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
 
         if unstable:
             print("\n" + color("Upgraded but did not verify as healthy:", Colors.BOLD))
-            for item, detail in unstable: print(f"  {color('!', Colors.RED)} {item}\n    {color(detail, Colors.DIM)}")
-            print(color("  The previous image for these was kept, in case you need to roll back manually.", Colors.DIM))
+            for item, detail, _ in unstable: print(f"  {color('!', Colors.RED)} {item}\n    {color(detail, Colors.DIM)}")
+            for proj in sorted({u[2] for u in unstable}):
+                print(color(f"  Undo with: docky rollback {proj}", Colors.DIM))
 
         if is_upgrade and total_upg > 0:
             print()
@@ -293,6 +295,49 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                 run_command(["docker", "image", "prune", "-f"])
                 sys.stdout.write(f"\r{color('✓', Colors.GREEN)} {color('Cleaned up old images.', Colors.DIM)}\033[K\n")
         print()
+
+def cmd_rollback(target=None, service=None):
+    state = docker_api.load_rollback_state()
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}{color('  ·  Rollback', Colors.DIM)}\n")
+
+    if not target:
+        if not state:
+            return print(color("  No rollback snapshots yet. One is saved automatically before each upgrade.", Colors.DIM) + "\n")
+        print(color("Available snapshots:", Colors.BOLD))
+        for proj, services in sorted(state.items()):
+            for svc, e in sorted(services.items()):
+                print(f"  {color(proj, Colors.CYAN)}/{svc:<18} {e['image']:<36} {color('saved ' + e['saved_at'], Colors.DIM)}")
+        return print(f"\n{color('Run:', Colors.DIM)} docky rollback <project> [service]\n")
+
+    projects = [p for p in docker_api.find_projects() if p["name"].lower() == target.lower()]
+    if not projects:
+        return print(f"{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
+    project = projects[0]
+    entries = state.get(project["name"], {})
+    if service:
+        entries = {k: v for k, v in entries.items() if k.lower() == service.lower()}
+    if not entries:
+        return print(color("  Nothing to roll back for that target.", Colors.YELLOW) + "\n")
+
+    containers = {c["service"]: c for c in docker_api.get_project_containers(project)}
+    failed = 0
+    for svc, entry in entries.items():
+        current = containers.get(svc, {}).get("running_id")
+        if current and current == entry["previous_id"]:
+            print(f"  {color('○', Colors.YELLOW)} {svc:<20} {color('already running the saved image', Colors.DIM)}")
+            continue
+        ok, err = docker_api.rollback_service(project, svc, entry)
+        if ok and svc in containers:
+            ok, err = docker_api.verify_container_health(containers[svc]["name"])
+        if ok:
+            docker_api.forget_snapshot(project["name"], svc)
+            print(f"  {color('✓', Colors.GREEN)} {svc:<20} {color('rolled back to ' + entry['image'] + ' (saved ' + entry['saved_at'] + ')', Colors.GREEN)}")
+        else:
+            failed += 1
+            print(f"  {color('!', Colors.RED)} {svc:<20} {color('rollback failed', Colors.RED)}\n    {color(err, Colors.DIM)}")
+    print()
+    if failed:
+        sys.exit(1)
 
 def cmd_sweep():
     metrics_before = get_system_metrics()
@@ -314,7 +359,7 @@ def cmd_sweep():
         if line.startswith("Containers space usage:"): in_imgs = False; continue
         if in_imgs and line and not line.startswith("REPOSITORY"):
             p = re.split(r'\s{2,}', line.strip())
-            if len(p) >= 8 and p[-1] == '0':
+            if len(p) >= 8 and p[-1] == '0' and not p[0].startswith("docky-rollback/"):
                 unused_images.append(f"{'Untagged Layer' if p[0] == '<none>' else f'{p[0]}:{p[1]}'} {color(f'({p[-4]})', Colors.DIM)} - {p[2]}")
 
     _, out_c, _ = run_command(["docker", "ps", "-a", "-f", "status=exited", "-f", "status=created", "--format", "{{.Names}} - {{.Status}}"])
@@ -342,7 +387,8 @@ def cmd_sweep():
         print("\n" + "─" * 55 + "\n")
 
     print(color("Deep Sweep Overview:", Colors.DIM))
-    print(color("  * Local volumes are kept safe. No app data will be deleted.", Colors.DIM) + "\n")
+    print(color("  * Local volumes are kept safe. No app data will be deleted.", Colors.DIM))
+    print(color("  * Rollback snapshots from 'docky upgrade' are kept.", Colors.DIM) + "\n")
     
     try: choice = input(color("[?] Do you want to execute a deep sweep? (y/N): ", Colors.BOLD)).strip().lower()
     except EOFError: choice = 'n'
@@ -350,7 +396,7 @@ def cmd_sweep():
     if choice in ['y', 'yes']:
         sys.stdout.write(f"\n{color('⠋', Colors.CYAN)} {color('Sweeping ghosts...', Colors.DIM)}\033[K")
         sys.stdout.flush()
-        succ, out, err = run_command(["docker", "system", "prune", "-a", "-f"])
+        succ, out, err = run_command(["docker", "system", "prune", "-a", "-f", "--filter", f"label!={docker_api.ROLLBACK_LABEL}=true"])
         
         metrics_after = get_system_metrics()
         
