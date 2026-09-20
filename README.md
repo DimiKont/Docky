@@ -20,10 +20,10 @@ docky <command> [target]
 
 | Command | Description |
 | --- | --- |
-| `status` | Show Docker projects, containers, and system metrics |
+| `status` | Show Docker projects, containers, and system metrics. Flags containers whose shared network (`network_mode: container:...`) points at a container that no longer exists |
 | `top` | Live CPU and RAM usage mapped to your projects |
 | `updates` | Check for available image updates |
-| `upgrade [name] [--dry-run]` | Pull and recreate outdated containers, verifying health. Give a project name to upgrade just that one; `--dry-run` shows the plan without changing anything |
+| `upgrade [name] [--dry-run]` | Pull and recreate outdated containers, verifying health. Give a project name to upgrade just that one; `--dry-run` shows the plan without changing anything. Services that share an upgraded service's network (`network_mode: service:X`) or depend on it with `restart: true` are recreated along with it, so e.g. qBittorrent behind gluetun keeps its connection. `rollback` does the same |
 | `rollback [name] [service]` | Undo the last upgrade. Docky saves the previous image before every upgrade; with no arguments this lists the saved snapshots |
 | `sweep` | Find and clear stopped containers and unused images |
 | `orphans` | Find volumes belonging to deleted or renamed projects |

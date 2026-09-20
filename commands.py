@@ -47,6 +47,7 @@ def cmd_status():
         
     total = sum(len(d["containers"]) for d in project_data)
     running = sum(1 for d in project_data for c in d["containers"] if c["state"].lower() == "running")
+    broken = []
 
     for p_idx, data in enumerate(project_data):
         project, containers = data["project"], data["containers"]
@@ -58,13 +59,24 @@ def cmd_status():
             print(f"{'   ' if is_last_p else '│  '}└─ {color('no containers', Colors.DIM)}")
             continue
 
+        orphaned = {c["name"] for c in docker_api.find_orphaned_containers(containers)}
         for c_idx, container in enumerate(containers):
             is_last_c = (c_idx == len(containers) - 1)
             c_branch = "└─" if is_last_c else "├─"
             prefix = f"{'   ' if is_last_p else '│  '}{c_branch} "
-            print(f"{prefix}{container_indicator(container['state'])} {container['short_name']}")
+            note = ""
+            if container["name"] in orphaned:
+                note = "  " + color("! network target is gone (no connectivity)", Colors.RED)
+                broken.append((project, container))
+            print(f"{prefix}{container_indicator(container['state'])} {container['short_name']}{note}")
 
     print(f"\n{color('●', Colors.GREEN)} {color(f'{running}/{total} containers running', Colors.DIM)}\n")
+    if broken:
+        print(color("! These containers share another container's network, but it was replaced or removed.", Colors.RED))
+        print(color("  They report as running but cannot reach anything. Recreate them:", Colors.DIM))
+        for project, container in broken:
+            print(f"    docker compose -f {project['compose']} up -d --no-deps --force-recreate {container['service']}")
+        print()
 
 
 def render_top_frame(project_data, stats_map, metrics):
@@ -198,6 +210,12 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
         total_cur, total_upd, total_upg, total_err, total_unk = 0, 0, 0, 0, 0
         errors = []
         unstable = []
+        dependency_maps = {}
+
+        def dependency_map(project):
+            if project["name"] not in dependency_maps:
+                dependency_maps[project["name"]] = docker_api.get_dependency_map(project)
+            return dependency_maps[project["name"]]
 
         for p_idx, data in enumerate(project_data):
             project, containers = data["project"], data["containers"]
@@ -241,6 +259,19 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                             total_err += 1; errors.append((name, err_msg))
                             print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgrade failed', Colors.RED)}\033[K")
                         else:
+                            # Anything sharing this service's network
+                            # (e.g. qBittorrent behind gluetun) is now
+                            # attached to the container we just replaced,
+                            # so it has to be recreated too.
+                            follower_results = []
+                            if docker_api.dependents_of(dependency_map(project), container["service"]):
+                                follow_future = executor.submit(docker_api.recreate_dependents, project, container["service"], dependency_map(project))
+                                while not follow_future.done():
+                                    sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color('recreating dependents...', Colors.YELLOW)}\033[K")
+                                    sys.stdout.flush()
+                                    idx += 1; time.sleep(0.08)
+                                follower_results = follow_future.result()
+
                             # The command succeeding doesn't mean the
                             # container actually came back up cleanly --
                             # confirm it before calling this a success.
@@ -257,10 +288,28 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                             else:
                                 total_err += 1; unstable.append((name, detail, project["name"]))
                                 print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('upgraded but unstable', Colors.RED)}\033[K")
+
+                            guide = f"{'   ' if is_last_p else '│  '}{'   ' if is_last_c else '│  '}"
+                            by_service = {c["service"]: c for c in containers}
+                            for dep_service, dep_ok, dep_err in follower_results:
+                                dep_name = by_service.get(dep_service, {}).get("short_name", dep_service)
+                                if dep_ok and dep_service in by_service:
+                                    dep_ok, dep_err = docker_api.verify_container_health(by_service[dep_service]["name"])
+                                if dep_ok:
+                                    print(f"{guide}{color('↳', Colors.GREEN)} {dep_name:<18} {color('recreated (follows ' + name + ')', Colors.GREEN)}")
+                                else:
+                                    total_err += 1
+                                    unstable.append((dep_name, dep_err, project["name"]))
+                                    print(f"{guide}{color('↳', Colors.RED)} {dep_name:<18} {color('recreate failed (follows ' + name + ')', Colors.RED)}")
                     else:
                         total_upd += 1
                         label = "would upgrade" if dry_run else "update available"
                         print(f"\r{prefix}{color('↑', Colors.YELLOW)} {name:<20} {color(label, Colors.YELLOW)}\033[K")
+                        if is_upgrade:
+                            followers = docker_api.dependents_of(dependency_map(project), container["service"])
+                            if followers:
+                                guide = f"{'   ' if is_last_p else '│  '}{'   ' if is_last_c else '│  '}"
+                                print(f"{guide}{color('↳ would also recreate: ' + ', '.join(followers), Colors.DIM)}")
                 else:
                     total_err += 1; errors.append((container["image"], res["error"]))
                     print(f"\r{prefix}{color('!', Colors.RED)} {name:<20} {color('check failed', Colors.RED)}\033[K")
@@ -327,11 +376,23 @@ def cmd_rollback(target=None, service=None):
             print(f"  {color('○', Colors.YELLOW)} {svc:<20} {color('already running the saved image', Colors.DIM)}")
             continue
         ok, err = docker_api.rollback_service(project, svc, entry)
+        follower_results = []
+        if ok:
+            dependency_map = docker_api.get_dependency_map(project)
+            follower_results = docker_api.recreate_dependents(project, svc, dependency_map)
         if ok and svc in containers:
             ok, err = docker_api.verify_container_health(containers[svc]["name"])
         if ok:
             docker_api.forget_snapshot(project["name"], svc)
             print(f"  {color('✓', Colors.GREEN)} {svc:<20} {color('rolled back to ' + entry['image'] + ' (saved ' + entry['saved_at'] + ')', Colors.GREEN)}")
+            for dep_service, dep_ok, dep_err in follower_results:
+                if dep_ok and dep_service in containers:
+                    dep_ok, dep_err = docker_api.verify_container_health(containers[dep_service]["name"])
+                if dep_ok:
+                    print(f"    {color('↳', Colors.GREEN)} {dep_service:<18} {color('recreated (follows ' + svc + ')', Colors.GREEN)}")
+                else:
+                    failed += 1
+                    print(f"    {color('↳', Colors.RED)} {dep_service:<18} {color('recreate failed', Colors.RED)}\n      {color(dep_err, Colors.DIM)}")
         else:
             failed += 1
             print(f"  {color('!', Colors.RED)} {svc:<20} {color('rollback failed', Colors.RED)}\n    {color(err, Colors.DIM)}")

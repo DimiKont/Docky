@@ -83,12 +83,12 @@ def get_project_containers(project):
         short_name = derive_short_name(name, project["name"])
         service = parts[4] if len(parts) >= 5 and parts[4] and "{{" not in parts[4] else short_name
 
-        inspect_success, inspect_output, _ = run_command(["docker", "container", "inspect", name, "--format", "{{.Image}}|{{.Config.Image}}"])
-        running_id, config_image = "", image
-        if inspect_success and inspect_output and "|" in inspect_output:
-            running_id, config_image = inspect_output.split("|", 1)
+        inspect_success, inspect_output, _ = run_command(["docker", "container", "inspect", name, "--format", "{{.Image}}|{{.Config.Image}}|{{.HostConfig.NetworkMode}}"])
+        running_id, config_image, network_mode = "", image, ""
+        if inspect_success and inspect_output and inspect_output.count("|") >= 2:
+            running_id, config_image, network_mode = inspect_output.split("|", 2)
 
-        containers.append({"name": name, "short_name": short_name, "state": state, "status": status, "image": config_image, "running_id": running_id, "service": service})
+        containers.append({"name": name, "short_name": short_name, "state": state, "status": status, "image": config_image, "running_id": running_id, "service": service, "network_mode": network_mode})
     return containers
 
 def get_containers_light(project):
@@ -206,6 +206,92 @@ def check_image(image, allow_pull=True):
 
     status = "current" if local_digest == remote_digest else "update"
     return {"status": status, "local": local_digest, "remote": remote_digest, "local_id": local_id, "error": None, "checked_via": "digest"}
+
+def get_dependency_map(project):
+    """
+    Which services have to follow another one when it is recreated:
+    {service: [dependents]}.
+
+    A service that joins another's network namespace
+    (`network_mode: service:X` / `container:X`, e.g. qBittorrent
+    behind gluetun) is bound to that one container instance. When
+    X is recreated on its own, the dependent keeps pointing at the
+    old, deleted container and ends up with no network at all --
+    it still shows as "running". `depends_on` entries with
+    `restart: true` are treated the same way: the author asked for
+    them to follow.
+    """
+    success, output, _ = run_command(
+        ["docker", "compose", "-f", str(project["compose"]), "config", "--format", "json"]
+    )
+    if not success or not output:
+        return {}
+    try:
+        services = json.loads(output).get("services", {})
+    except json.JSONDecodeError:
+        return {}
+
+    by_container_name = {s["container_name"]: n for n, s in services.items() if s.get("container_name")}
+    dependents = {}
+    for name, svc in services.items():
+        parents = set()
+        mode = svc.get("network_mode") or ""
+        if mode.startswith("service:"):
+            parents.add(mode.split(":", 1)[1])
+        elif mode.startswith("container:") and mode.split(":", 1)[1] in by_container_name:
+            parents.add(by_container_name[mode.split(":", 1)[1]])
+        depends_on = svc.get("depends_on") or {}
+        if isinstance(depends_on, dict):
+            parents.update(p for p, opts in depends_on.items() if isinstance(opts, dict) and opts.get("restart"))
+        for parent in parents:
+            if parent != name and parent in services:
+                dependents.setdefault(parent, set()).add(name)
+    return {parent: sorted(children) for parent, children in dependents.items()}
+
+def dependents_of(dependency_map, service):
+    """Everything downstream of `service`, transitively, parents before children."""
+    ordered, queue, seen = [], [service], {service}
+    while queue:
+        for child in dependency_map.get(queue.pop(0), []):
+            if child not in seen:
+                seen.add(child)
+                ordered.append(child)
+                queue.append(child)
+    return ordered
+
+def recreate_dependents(project, service, dependency_map):
+    """
+    Recreate everything that follows `service` so it re-attaches to
+    the new container. Returns [(service, ok, error)].
+
+    --force-recreate is required: a plain restart would reuse the
+    stale network reference. --no-deps/--pull never keeps this from
+    touching anything but the dependent itself.
+    """
+    results = []
+    for dependent in dependents_of(dependency_map, service):
+        succ, _, err = run_command([
+            "docker", "compose", "-f", str(project["compose"]),
+            "up", "-d", "--no-deps", "--force-recreate", "--pull", "never", dependent,
+        ])
+        results.append((dependent, succ, "" if succ else f"up failed: {err}"))
+    return results
+
+def find_orphaned_containers(containers):
+    """
+    Containers whose `network_mode: container:<id>` target no longer
+    exists. They still report "running" but have no usable network.
+    """
+    orphans = []
+    for c in containers:
+        mode = c.get("network_mode") or ""
+        if not mode.startswith("container:"):
+            continue
+        target = mode.split(":", 1)[1]
+        succ, _, _ = run_command(["docker", "container", "inspect", target, "--format", "{{.Id}}"])
+        if not succ:
+            orphans.append(c)
+    return orphans
 
 def upgrade_service(compose_file, service_name):
     succ, _, err = run_command(["docker", "compose", "-f", str(compose_file), "pull", service_name])
