@@ -20,6 +20,7 @@ docky <command> [target]
 
 | Command | Description |
 | --- | --- |
+| `projects` | List every project Docky found, where it lives, and the compose files it uses |
 | `status` | Show Docker projects, containers, and system metrics. Flags containers whose shared network (`network_mode: container:...`) points at a container that no longer exists |
 | `top` | Live CPU and RAM usage mapped to your projects |
 | `updates` | Check for available image updates |
@@ -29,7 +30,20 @@ docky <command> [target]
 | `orphans` | Find volumes belonging to deleted or renamed projects |
 | `start` / `stop` / `restart` `<name\|all>` | Control a project or all of them |
 
-Docky looks for Compose projects in `~/docker` (up to two levels deep).
+## Where Docky finds your projects
+
+Your stacks can live anywhere. Docky finds them in two ways:
+
+1. **From Docker itself.** Every container Compose starts is labelled with its project name, folder and compose files. Any project with at least one container (running or stopped) is found automatically, wherever its folder is.
+2. **By scanning folders**, for projects that exist on disk but haven't been started yet. By default Docky looks in `~/docker`, up to two levels deep. To use other folders, set `DOCKY_ROOT` to one or more paths separated by `:`:
+
+   ```bash
+   export DOCKY_ROOT=/opt/stacks:/srv/compose:~/homelab
+   ```
+
+Run `docky projects` to see what was found and from where. Commands take a project name, or its folder path when two projects share a name (`docky restart /opt/stacks/app`).
+
+Docky runs Compose with the same files the project was started with, so `docker-compose.override.yml` and friends are kept. If a project's folder is moved or deleted while its containers still exist, `docky status` warns about it instead of guessing.
 
 ## License
 
