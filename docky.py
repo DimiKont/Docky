@@ -12,6 +12,7 @@ def show_usage():
     print(color("Commands:", Colors.BOLD))
     cmds = [
         ("status", "Show Docker projects, containers, and system metrics"),
+        ("projects", "List every project Docky found and where it lives"),
         ("top", "Show real-time CPU and RAM usage mapped to your projects"),
         ("updates", "Check for available image updates"),
         ("upgrade [name] [--dry-run]", "Pull and recreate outdated containers (all, or one project)"),
@@ -24,7 +25,8 @@ def show_usage():
     ]
     for cmd, desc in cmds:
         print(f"  {color(f'{cmd:<28}', Colors.CYAN)} {desc}")
-    print()
+    print(f"\n{color('Projects:', Colors.BOLD)} found from Docker itself, wherever they live, plus folders in")
+    print(f"  {color('DOCKY_ROOT', Colors.CYAN)} (':'-separated paths, default ~/docker). A path works as a target too.\n")
 
 def preflight():
     """Fail with a readable message if Docker isn't installed or reachable."""
@@ -49,6 +51,7 @@ def main():
         if cmd in ("help", "-h", "--help"):
             return show_usage()
         if cmd == "status": commands.cmd_status()
+        elif cmd == "projects": commands.cmd_projects()
         elif cmd == "top": commands.cmd_top()
         elif cmd in ("updates", "update"): commands.cmd_updates(is_upgrade=False)
         elif cmd == "upgrade":

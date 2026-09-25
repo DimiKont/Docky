@@ -8,31 +8,178 @@ from datetime import datetime
 from pathlib import Path
 from utils import run_command
 
-DOCKER_ROOT = Path.home() / "docker"
-COMPOSE_FILENAMES = ("compose.yml", "compose.yaml", "docker-compose.yml", "docker-compose.yaml")
+COMPOSE_FILENAMES = ("compose.yaml", "compose.yml", "docker-compose.yaml", "docker-compose.yml")
+DEFAULT_ROOT = Path.home() / "docker"
+SCAN_DEPTH = 2
+
+LABEL_PROJECT = "com.docker.compose.project"
+LABEL_WORKDIR = "com.docker.compose.project.working_dir"
+LABEL_CONFIG_FILES = "com.docker.compose.project.config_files"
+LABEL_ENV_FILE = "com.docker.compose.project.environment_file"
+
+def scan_roots():
+    """
+    Folders to scan for Compose projects that Docker doesn't know
+    about yet (never started, or all containers removed).
+
+    DOCKY_ROOT takes one or more paths separated by ':' (like PATH).
+    Unset, Docky falls back to ~/docker.
+    """
+    raw = os.environ.get("DOCKY_ROOT", "")
+    roots = [Path(p).expanduser() for p in raw.split(os.pathsep) if p.strip()]
+    return roots or [DEFAULT_ROOT]
+
+def _override_for(compose_file):
+    """The override file Compose would pick up on its own, if any."""
+    stem = compose_file.stem
+    for ext in (".yaml", ".yml"):
+        candidate = compose_file.with_name(f"{stem}.override{ext}")
+        if candidate.exists():
+            return candidate
+    return None
+
+def _subdirs(directory):
+    try:
+        return sorted(d for d in directory.iterdir() if d.is_dir() and not d.name.startswith("."))
+    except OSError:
+        # Unreadable (e.g. a root-owned data folder) -- skip, don't crash.
+        return []
+
+def _compose_file_in(directory):
+    for filename in COMPOSE_FILENAMES:
+        candidate = directory / filename
+        try:
+            if candidate.is_file():
+                return candidate
+        except OSError:
+            return None
+    return None
+
+def _discover_from_docker():
+    """
+    Every Compose project Docker has containers for, wherever it lives.
+
+    Compose stamps each container with the project's name, working
+    directory and the exact compose files it was started from
+    (overrides included). That's the ground truth -- no guessing
+    about folder layout.
+    """
+    fmt = "|".join('{{.Label "%s"}}' % l for l in (LABEL_PROJECT, LABEL_WORKDIR, LABEL_CONFIG_FILES, LABEL_ENV_FILE))
+    success, output, _ = run_command(["docker", "ps", "-a", "--filter", f"label={LABEL_PROJECT}", "--format", fmt])
+    if not success:
+        return []
+
+    found = {}
+    for line in output.splitlines():
+        parts = (line.split("|") + ["", "", "", ""])[:4]
+        name, workdir, config_files, env_files = (p.strip() for p in parts)
+        if not name or name in found:
+            continue
+        base = Path(workdir) if workdir else None
+
+        def resolve(raw):
+            path = Path(raw)
+            return path if path.is_absolute() or base is None else base / path
+
+        files = [resolve(f) for f in config_files.split(",") if f.strip()]
+        envs = [resolve(e) for e in env_files.split(",") if e.strip()]
+        found[name] = {
+            "name": name,
+            "project_name": name,
+            "path": base or (files[0].parent if files else None),
+            "files": files,
+            "env_files": [e for e in envs if e.exists()],
+            "source": "docker",
+            "missing": [f for f in files if not f.exists()] or ([] if files else ["(no compose file recorded)"]),
+        }
+    return list(found.values())
+
+def _discover_from_folders(roots):
+    """Compose files on disk under the scan roots (and the roots themselves)."""
+    projects = []
+    for root in roots:
+        level = [root] if root.is_dir() else []
+        candidates = []
+        for depth in range(SCAN_DEPTH + 1):
+            candidates.extend(level)
+            if depth < SCAN_DEPTH:
+                level = [child for d in level for child in _subdirs(d)]
+        for directory in candidates:
+            compose_file = _compose_file_in(directory)
+            if not compose_file:
+                continue
+            override = _override_for(compose_file)
+            projects.append({
+                "name": directory.resolve().name,
+                "project_name": None,  # let Compose derive it (honours a `name:` key)
+                "path": directory,
+                "files": [compose_file] + ([override] if override else []),
+                "env_files": [],
+                "source": "folder",
+                "missing": [],
+            })
+    return projects
+
+def _same_location(a, b):
+    try:
+        return a is not None and b is not None and Path(a).resolve() == Path(b).resolve()
+    except OSError:
+        return False
+
+def discover_projects():
+    """
+    All Compose projects, from both sources, merged:
+      {"projects": usable projects, "stale": deployed projects whose
+       compose files are gone (moved or deleted folder)}
+
+    Docker's record wins when both sources see the same project, since
+    it knows the exact files and project name the stack runs with.
+    """
+    from_docker = _discover_from_docker()
+    projects = [p for p in from_docker if not p["missing"]]
+    stale = [p for p in from_docker if p["missing"]]
+
+    known_files = {f.resolve() for p in projects for f in p["files"]}
+    for candidate in _discover_from_folders(scan_roots()):
+        if candidate["files"][0].resolve() in known_files:
+            continue
+        if any(_same_location(candidate["path"], p["path"]) for p in projects):
+            continue
+        # A stale Docker record whose folder still has a compose file (e.g. it
+        # was renamed from docker-compose.yml to compose.yaml) is that project:
+        # keep the name its containers run under.
+        match = next((s for s in stale if _same_location(candidate["path"], s["path"])), None)
+        if match:
+            stale.remove(match)
+            candidate.update(name=match["name"], project_name=match["project_name"])
+        projects.append(candidate)
+        known_files.update(f.resolve() for f in candidate["files"])
+
+    projects.sort(key=lambda p: (p["name"].lower(), str(p["path"])))
+    stale.sort(key=lambda p: p["name"].lower())
+    return {"projects": projects, "stale": stale}
 
 def find_projects():
-    projects = []
-    if not DOCKER_ROOT.exists():
-        return projects
+    return discover_projects()["projects"]
 
-    directories_to_check = []
-    for level_1 in DOCKER_ROOT.iterdir():
-        if level_1.is_dir():
-            directories_to_check.append(level_1)
-            for level_2 in level_1.iterdir():
-                if level_2.is_dir():
-                    directories_to_check.append(level_2)
+def compose_cmd(project, *args):
+    """
+    `docker compose ...` pointed at exactly this project.
 
-    for directory in directories_to_check:
-        for filename in COMPOSE_FILENAMES:
-            compose_file = directory / filename
-            if compose_file.exists():
-                if not any(p["path"] == directory for p in projects):
-                    projects.append({"name": directory.name, "path": directory, "compose": compose_file})
-                break
-    projects.sort(key=lambda p: p["name"])
-    return projects
+    Every compose file is passed with its own -f: giving -f at all turns
+    off Compose's automatic pick-up of docker-compose.override.yml, so
+    the override has to be listed explicitly or its settings are lost.
+    """
+    cmd = ["docker", "compose"]
+    if project.get("project_name"):
+        cmd += ["-p", project["project_name"]]
+    if project.get("path"):
+        cmd += ["--project-directory", str(project["path"])]
+    for f in project["files"]:
+        cmd += ["-f", str(f)]
+    for e in project.get("env_files", []):
+        cmd += ["--env-file", str(e)]
+    return cmd + list(args)
 
 def sanitize_project_name(name):
     """Compose's own normalisation: lowercase, keep only [a-z0-9_-]."""
@@ -50,7 +197,7 @@ def resolve_project_names(project):
     """
     names = {project["name"], sanitize_project_name(project["name"])}
     success, output, _ = run_command(
-        ["docker", "compose", "-f", str(project["compose"]), "config", "--format", "json"]
+        compose_cmd(project, "config", "--format", "json")
     )
     if success and output:
         try:
@@ -69,7 +216,7 @@ def derive_short_name(name, project_name):
 
 def get_project_containers(project):
     success, output, _ = run_command(
-        ["docker", "compose", "-f", str(project["compose"]), "ps", "-a", "--format", "{{.Name}}|{{.State}}|{{.Status}}|{{.Image}}|{{.Service}}"]
+        compose_cmd(project, "ps", "-a", "--format", "{{.Name}}|{{.State}}|{{.Status}}|{{.Image}}|{{.Service}}")
     )
     if not success:
         return []
@@ -103,7 +250,7 @@ def get_containers_light(project):
     refresh tick.
     """
     success, output, _ = run_command(
-        ["docker", "compose", "-f", str(project["compose"]), "ps", "-a", "--format", "{{.Name}}|{{.State}}"]
+        compose_cmd(project, "ps", "-a", "--format", "{{.Name}}|{{.State}}")
     )
     if not success:
         return []
@@ -222,7 +369,7 @@ def get_dependency_map(project):
     them to follow.
     """
     success, output, _ = run_command(
-        ["docker", "compose", "-f", str(project["compose"]), "config", "--format", "json"]
+        compose_cmd(project, "config", "--format", "json")
     )
     if not success or not output:
         return {}
@@ -270,10 +417,9 @@ def recreate_dependents(project, service, dependency_map):
     """
     results = []
     for dependent in dependents_of(dependency_map, service):
-        succ, _, err = run_command([
-            "docker", "compose", "-f", str(project["compose"]),
-            "up", "-d", "--no-deps", "--force-recreate", "--pull", "never", dependent,
-        ])
+        succ, _, err = run_command(compose_cmd(
+            project, "up", "-d", "--no-deps", "--force-recreate", "--pull", "never", dependent,
+        ))
         results.append((dependent, succ, "" if succ else f"up failed: {err}"))
     return results
 
@@ -293,10 +439,10 @@ def find_orphaned_containers(containers):
             orphans.append(c)
     return orphans
 
-def upgrade_service(compose_file, service_name):
-    succ, _, err = run_command(["docker", "compose", "-f", str(compose_file), "pull", service_name])
+def upgrade_service(project, service_name):
+    succ, _, err = run_command(compose_cmd(project, "pull", service_name))
     if not succ: return False, f"pull failed: {err}"
-    succ, _, err = run_command(["docker", "compose", "-f", str(compose_file), "up", "-d", service_name])
+    succ, _, err = run_command(compose_cmd(project, "up", "-d", service_name))
     if not succ: return False, f"up failed: {err}"
     return True, ""
 
@@ -367,10 +513,9 @@ def rollback_service(project, service, entry):
     succ, _, err = run_command(["docker", "tag", entry["tag"], image_ref])
     if not succ:
         return False, f"tag failed: {err}"
-    succ, _, err = run_command([
-        "docker", "compose", "-f", str(project["compose"]),
-        "up", "-d", "--no-deps", "--pull", "never", service,
-    ])
+    succ, _, err = run_command(compose_cmd(
+        project, "up", "-d", "--no-deps", "--pull", "never", service,
+    ))
     if not succ:
         return False, f"up failed: {err}"
     return True, ""

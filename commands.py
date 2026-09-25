@@ -3,6 +3,8 @@ import sys
 import time
 import re
 import concurrent.futures
+import shlex
+from pathlib import Path
 from utils import Colors, color, run_command, get_system_metrics, parse_pct, render_bar
 import docker_api
 
@@ -16,6 +18,64 @@ def container_indicator(state):
     if state == "exited": return color("✕", Colors.RED)
     if state in ("restarting", "created"): return color("↻", Colors.YELLOW)
     return color("○", Colors.YELLOW)
+
+def no_projects_message():
+    roots = ", ".join(str(r) for r in docker_api.scan_roots())
+    return (
+        f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n"
+        + color(f"  Docky checks every Compose project Docker is running, plus folders under: {roots}\n", Colors.DIM)
+        + color("  Keep stacks elsewhere? Point Docky at them: export DOCKY_ROOT=/path/one:/path/two\n", Colors.DIM)
+    )
+
+def select_projects(projects, target):
+    """
+    Projects matching `target` -- a project name or its folder path.
+    Returns (matches, error). Two projects can share a folder name in
+    different places; a name that's ambiguous is refused rather than
+    acting on both.
+    """
+    try:
+        target_path = Path(target).expanduser().resolve()
+    except OSError:
+        target_path = None
+    by_path = [p for p in projects if p["path"] and target_path and Path(p["path"]).resolve() == target_path]
+    if by_path:
+        return by_path[:1], None
+    by_name = [p for p in projects if p["name"].lower() == target.lower()]
+    if not by_name:
+        return [], f"Project {target} not found. Run 'docky projects' to see what Docky found."
+    if len(by_name) > 1:
+        paths = "\n".join(f"    {p['path']}" for p in by_name)
+        return [], f"'{target}' matches more than one project. Use its folder path instead:\n{paths}"
+    return by_name, None
+
+def cmd_projects():
+    """Where every project was found -- the quickest way to check discovery."""
+    found = docker_api.discover_projects()
+    projects, stale = found["projects"], found["stale"]
+    print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  Projects', Colors.DIM)}\n")
+    if not projects and not stale:
+        return print(no_projects_message())
+    for project in projects:
+        source = "running in Docker" if project["source"] == "docker" else "found on disk"
+        name = project["name"].ljust(20)
+        print(f"  {color('●', Colors.GREEN)} {color(name, Colors.CYAN + Colors.BOLD)} {project['path']}  {color(source, Colors.DIM)}")
+        for f in project["files"]:
+            print(color(f"      {f}", Colors.DIM))
+    for project in stale:
+        name = project["name"].ljust(20)
+        print(f"  {color('!', Colors.RED)} {color(name, Colors.CYAN + Colors.BOLD)} {project['path']}  {color('compose files missing', Colors.RED)}")
+    roots = ", ".join(str(r) for r in docker_api.scan_roots())
+    print(color(f"\n  Scanned folders: {roots}  (set DOCKY_ROOT to change)\n", Colors.DIM))
+
+def print_stale(stale):
+    if not stale:
+        return
+    print(color("! These projects have containers, but their compose files are gone (folder moved or deleted?):", Colors.YELLOW))
+    for project in stale:
+        print(color(f"    {project['name']:<18} expected {', '.join(str(f) for f in project['missing'])}", Colors.DIM))
+    print(color("  Docky can't manage them until the files are back. If you moved the folder, add its parent to DOCKY_ROOT.", Colors.DIM))
+    print()
 
 def fetch_project_data(projects, executor):
     sys.stdout.write(f"\r{color('⠋', Colors.CYAN)} {color('Discovering containers...', Colors.DIM)}\033[K")
@@ -32,9 +92,11 @@ def fetch_project_data(projects, executor):
     return [{"project": p, "containers": f.result()} for p, f in zip(projects, futures)]
 
 def cmd_status():
-    projects = docker_api.find_projects()
+    found = docker_api.discover_projects()
+    projects, stale = found["projects"], found["stale"]
     if not projects:
-        print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+        print_stale(stale)
+        print(no_projects_message())
         return
 
     print()
@@ -75,8 +137,9 @@ def cmd_status():
         print(color("! These containers share another container's network, but it was replaced or removed.", Colors.RED))
         print(color("  They report as running but cannot reach anything. Recreate them:", Colors.DIM))
         for project, container in broken:
-            print(f"    docker compose -f {project['compose']} up -d --no-deps --force-recreate {container['service']}")
+            print(f"    {shlex.join(docker_api.compose_cmd(project, 'up', '-d', '--no-deps', '--force-recreate', container['service']))}")
         print()
+    print_stale(stale)
 
 
 def render_top_frame(project_data, stats_map, metrics):
@@ -136,7 +199,7 @@ def render_top_frame(project_data, stats_map, metrics):
 def cmd_top():
     projects = docker_api.find_projects()
     if not projects:
-        return print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+        return print(no_projects_message())
 
     print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color('  ·  Resource Monitor', Colors.DIM)}\n")
 
@@ -187,12 +250,12 @@ def cmd_top():
 def cmd_updates(is_upgrade=False, target=None, dry_run=False):
     projects = docker_api.find_projects()
     if not projects:
-        return print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)}\n\n{color('  No Docker Compose projects found.', Colors.YELLOW)}\n")
+        return print(no_projects_message())
 
     if target:
-        projects = [p for p in projects if p["name"].lower() == target.lower()]
-        if not projects:
-            return print(f"\n{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
+        projects, error = select_projects(projects, target)
+        if error:
+            return print(f"\n{color('!', Colors.RED)} {color(error, Colors.RED)}\n")
 
     print()
     title = "Image Updates"
@@ -248,7 +311,7 @@ def cmd_updates(is_upgrade=False, target=None, dry_run=False):
                 elif status == "update":
                     if is_upgrade and not dry_run:
                         docker_api.snapshot_service(project, container)
-                        upg_future = executor.submit(docker_api.upgrade_service, project["compose"], container["service"])
+                        upg_future = executor.submit(docker_api.upgrade_service, project, container["service"])
                         while not upg_future.done():
                             sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color('pulling & recreating...', Colors.YELLOW)}\033[K")
                             sys.stdout.flush()
@@ -358,9 +421,9 @@ def cmd_rollback(target=None, service=None):
                 print(f"  {color(proj, Colors.CYAN)}/{svc:<18} {e['image']:<36} {color('saved ' + e['saved_at'], Colors.DIM)}")
         return print(f"\n{color('Run:', Colors.DIM)} docky rollback <project> [service]\n")
 
-    projects = [p for p in docker_api.find_projects() if p["name"].lower() == target.lower()]
-    if not projects:
-        return print(f"{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
+    projects, error = select_projects(docker_api.find_projects(), target)
+    if error:
+        return print(f"{color('!', Colors.RED)} {color(error, Colors.RED)}\n")
     project = projects[0]
     entries = state.get(project["name"], {})
     if service:
@@ -471,12 +534,12 @@ def cmd_sweep():
 
 def cmd_lifecycle(action, target):
     projects = docker_api.find_projects()
-    if not projects: return
+    if not projects: return print(no_projects_message())
     
     if target.lower() != "all":
-        projects = [p for p in projects if p["name"].lower() == target.lower()]
-        if not projects:
-            return print(f"\n{color('!', Colors.RED)} {color(f'Project {target} not found.', Colors.RED)}\n")
+        projects, error = select_projects(projects, target)
+        if error:
+            return print(f"\n{color('!', Colors.RED)} {color(error, Colors.RED)}\n")
     else:
         print(f"\n{color(f'! WARNING: You are about to {action} ALL {len(projects)} projects.', Colors.YELLOW)}")
         try: choice = input(color("[?] Proceed? (y/N): ", Colors.BOLD)).strip().lower()
@@ -486,13 +549,17 @@ def cmd_lifecycle(action, target):
     print(f"\n{color('● DOCKY', Colors.BOLD + Colors.CYAN)} {color(f'  ·  {action.capitalize()}ing Projects', Colors.DIM)}\n")
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        futures = {p["name"]: executor.submit(lambda prj: run_command(["docker", "compose", "-f", str(prj["compose"]), action]), p) for p in projects}
+        # `compose start` only wakes existing containers. A project found on
+        # disk has none yet, so starting it means creating them.
+        def lifecycle_args(p):
+            return ("up", "-d") if action == "start" and p["source"] == "folder" else (action,)
+        futures = [executor.submit(run_command, docker_api.compose_cmd(p, *lifecycle_args(p))) for p in projects]
         success_c, error_c = 0, 0
         for p_idx, project in enumerate(projects):
             name = project["name"]
             is_last = (p_idx == len(projects) - 1)
             prefix = f"{'└─' if is_last else '├─'} "
-            future = futures[name]
+            future = futures[p_idx]
             idx = 0
             while not future.done():
                 sys.stdout.write(f"\r{prefix}{color(get_spinner(idx), Colors.CYAN)} {name:<20} {color(f'{action}ing...', Colors.YELLOW)}\033[K")
@@ -512,25 +579,30 @@ def cmd_orphans():
     sys.stdout.write(f"{color('⠋', Colors.CYAN)} {color('Scanning volumes...', Colors.DIM)}\033[K")
     sys.stdout.flush()
 
-    projects = docker_api.find_projects()
+    found = docker_api.discover_projects()
+    projects = found["projects"]
 
     # With no projects discovered, every Compose volume would look
     # orphaned. That's almost always a wrong/missing/unmounted
-    # DOCKER_ROOT, not a real cleanup opportunity -- refuse to guess.
+    # DOCKY_ROOT, not a real cleanup opportunity -- refuse to guess.
     if not projects:
+        roots = ", ".join(str(r) for r in docker_api.scan_roots())
         return print(
-            f"\r\033[K{color('!', Colors.RED)} {color(f'No Compose projects found under {docker_api.DOCKER_ROOT}.', Colors.RED)}\n"
+            f"\r\033[K{color('!', Colors.RED)} {color(f'No Compose projects found (Docker has none, and none on disk under {roots}).', Colors.RED)}\n"
             + color("  Refusing to check for orphans: every volume would be flagged. Is the directory missing or unmounted?", Colors.DIM) + "\n"
         )
 
-    known_project_names = set()
+    # A project whose compose files went missing still has containers,
+    # so its volumes are in use -- never call those orphaned.
+    known_project_names = {p["name"] for p in found["stale"]}
     for p in projects:
         known_project_names |= docker_api.resolve_project_names(p)
 
     all_volumes = docker_api.get_all_volumes()
 
     # "Orphaned" = Compose stamped this volume with a project name,
-    # and no folder by that name exists under DOCKER_ROOT anymore.
+    # and Docky can't find that project anywhere: no containers run
+    # under it and no compose file for it exists under DOCKY_ROOT.
     # Volumes with no project label at all weren't created by
     # Compose (or predate this labeling) -- we can't safely reason
     # about ownership for those, so they're surfaced as a count
@@ -558,7 +630,8 @@ def cmd_orphans():
         print(f"  {color('✕', Colors.RED)} {v['name']:<32} {label:<26} {color(size_str, Colors.YELLOW)}")
 
     print()
-    print(color(f"These belong to project folders no longer under {docker_api.DOCKER_ROOT}", Colors.DIM))
+    print(color("No container runs under these projects and no compose file for them was found", Colors.DIM))
+    print(color(f"under {', '.join(str(r) for r in docker_api.scan_roots())} (set DOCKY_ROOT if your stacks live elsewhere)", Colors.DIM))
     print(color("-- likely deleted or renamed projects.", Colors.DIM))
     print()
 
